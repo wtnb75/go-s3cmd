@@ -534,7 +534,7 @@ func listlocal(basedir string) map[string]entry {
 	rst := map[string]entry{}
 	filepath.Walk(basedir, func(pathname string, info os.FileInfo, err error) error {
 		if !strings.HasPrefix(pathname, basedir) {
-			log.Println("invalid path?")
+			log.Println("invalid path?", pathname, basedir)
 			return err
 		}
 		pathname = strings.TrimPrefix(pathname, basedir)
@@ -565,7 +565,7 @@ func lists3(s3url string) map[string]entry {
 		for _, k := range rsp.Contents {
 			keystr := strings.TrimPrefix(k.Key, prefix)
 			lm, _ := time.Parse("2006-01-02T15:04:05.000Z07:00", k.LastModified)
-			rst[keystr] = entry{size: k.Size, cksum: k.ETag, lastmod: lm}
+			rst[keystr] = entry{size: k.Size, cksum: strings.Trim(k.ETag, "\""), lastmod: lm}
 		}
 		marker = rsp.NextMarker
 		if !rsp.IsTruncated {
@@ -754,6 +754,7 @@ func setup(c *cli.Context) {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	app := cli.NewApp()
 	app.Name = "s3cmd"
 	app.Usage = "AWS S3 API Client"

@@ -78,6 +78,18 @@ func rb(c *cli.Context) {
 	}
 }
 
+func lsshowd(bkt *s3.Bucket, k string, longfmt bool) {
+	fmt.Printf("%24s %10s  s3://%s/%s\n", "", "DIR", bkt.Name, k)
+}
+
+func lsshow(bkt *s3.Bucket, k s3.Key, longfmt bool) {
+	if longfmt {
+		fmt.Printf("%v %10d  %s %s s3://%s/%s\n", k.LastModified, k.Size, k.ETag, k.Owner.DisplayName, bkt.Name, k.Key)
+	} else {
+		fmt.Printf("%v %10d  s3://%s/%s\n", k.LastModified, k.Size, bkt.Name, k.Key)
+	}
+}
+
 func ls(c *cli.Context) {
 	setup(c)
 	if len(c.Args()) == 0 {
@@ -99,16 +111,23 @@ func ls(c *cli.Context) {
 				log.Fatal("invalid url:", err)
 			}
 			var marker string
+			delim := "/"
+			if c.Bool("recursive") {
+				delim = ""
+			}
 			for {
-				rsp, err := bkt.List(prefix, "", marker, 1000)
+				rsp, err := bkt.List(prefix, delim, marker, 1000)
 				if err != nil {
 					log.Println("error List", err)
 					break
 				}
 				// log.Printf("list result: %+v", rsp)
+				for _, k := range rsp.CommonPrefixes {
+					lsshowd(bkt, k, c.Bool("long"))
+				}
 				for _, k := range rsp.Contents {
 					// log.Printf("%+v\n", k)
-					fmt.Printf("%v %10d  s3://%s/%s\n", k.LastModified, k.Size, bkt.Name, k.Key)
+					lsshow(bkt, k, c.Bool("long"))
 				}
 				marker = rsp.NextMarker
 				if !rsp.IsTruncated {
@@ -814,11 +833,26 @@ func main() {
 			ShortName: "ls",
 			Usage:     "list objects or buckets",
 			Action:    ls,
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "long,l",
+					Usage: "use long listing format",
+				},
+				cli.BoolFlag{
+					Name: "recursive,R",
+				},
+			},
 		}, {
 			Name:      "list-all",
 			ShortName: "la",
 			Usage:     "list all object in all buckets",
 			Action:    la,
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "long,l",
+					Usage: "use long listing format",
+				},
+			},
 		}, {
 			Name:      "put",
 			ShortName: "write",

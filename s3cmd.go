@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -206,7 +207,7 @@ func reader_s3(s3cl *s3.S3, urlstr string, hdr http.Header) (res io.ReadCloser) 
 	}
 	rsp, err := bkt.GetResponseWithHeaders(key, hdr)
 	if err != nil || rsp == nil {
-		log.Fatal("reader error", err)
+		log.Fatal("reader error ", urlstr, err)
 		return nil
 	}
 	return rsp.Body
@@ -216,9 +217,20 @@ func cat(c *cli.Context) {
 	setup(c)
 	args := c.Args()
 	for _, us := range args {
-		rd := reader_s3(s3cl, us, make(http.Header))
-		io.Copy(os.Stdout, rd)
-		rd.Close()
+		if c.Bool("recursive") {
+			res := lists3(us, "")
+			for k, v := range res {
+				if v.size != 0 {
+					rd := reader_s3(s3cl, us+k, make(http.Header))
+					io.Copy(os.Stdout, rd)
+					rd.Close()
+				}
+			}
+		} else {
+			rd := reader_s3(s3cl, us, make(http.Header))
+			io.Copy(os.Stdout, rd)
+			rd.Close()
+		}
 	}
 }
 
@@ -437,6 +449,7 @@ func listmulti(c *cli.Context) {
 }
 
 func merge(c *cli.Context) {
+	setup(c)
 	args := c.Args()
 	dst := args[0]
 	src := args[1:]
@@ -449,17 +462,79 @@ func merge(c *cli.Context) {
 	if err != nil {
 		log.Fatal("url parse ", dst, err)
 	}
-	multi, err := dstbkt.InitMulti(dstbase, c.String("content-type"), s3.Private, s3.Options{})
-	parts := []s3.Part{}
-	for i, srcobj := range src {
-		srcbkt, srcbase, err := url2bktpath(s3cl, srcobj)
-		if err != nil {
-			log.Fatal("parse ", srcobj, err)
+	log.Println("dst", dstbkt, dstbase)
+	srcurls := map[string]entry{}
+	for _, s := range src {
+		res := lists3(s, "")
+		log.Println("srcfiles", s, len(res))
+		for k, v := range res {
+			if v.size == 0 {
+				continue
+			}
+			srcurls[s+k] = v
 		}
-		srcbktstr := srcbkt.Name
-		res, part, err := multi.PutPartCopy(i+1, s3.CopyOptions{}, path.Join(srcbktstr, srcbase))
-		log.Println("res=", res, part, err)
+	}
+	var down, copy int
+	var downsz, copysz int64
+	for _, v := range srcurls {
+		if v.size > 5*1024*1024 {
+			copy += 1
+			copysz += v.size
+		} else {
+			down += 1
+			downsz += v.size
+		}
+	}
+	log.Println("down", down, downsz)
+	log.Println("copy", copy, copysz)
+	if c.Bool("dry-run") {
+		return
+	}
+	var buf bytes.Buffer
+	parts := []s3.Part{}
+	multi, err := dstbkt.InitMulti(dstbase, c.String("content-type"), s3.Private, s3.Options{})
+	if err != nil {
+		log.Fatal("init multi ", dstbase, err)
+	}
+	for s, v := range srcurls {
+		if v.size > 5*1024*1024 {
+			if buf.Len() != 0 {
+				rdbuf := bytes.NewReader(buf.Bytes())
+				log.Println("put", buf.Len())
+				part, err := multi.PutPart(len(parts)+1, rdbuf)
+				if err != nil {
+					log.Fatal("PutPart ", err)
+				}
+				parts = append(parts, part)
+				buf.Reset()
+			}
+			srcbkt, srcbase, err := url2bktpath(s3cl, s)
+			if err != nil {
+				log.Fatal("src ", s, err)
+			}
+			srcbktstr := srcbkt.Name
+			log.Println("copy", s)
+			res, part, err := multi.PutPartCopy(len(parts)+1, s3.CopyOptions{}, path.Join(srcbktstr, srcbase))
+			if err != nil {
+				log.Fatal("PutPartCopy ", s, err, res)
+			}
+			parts = append(parts, part)
+		}
+		log.Println("read", s)
+		rsz, err := buf.ReadFrom(reader_s3(s3cl, s, make(http.Header)))
+		if rsz != v.size || err != nil {
+			log.Fatal("copy error ", s, rsz, err)
+		}
+	}
+	if buf.Len() != 0 {
+		rdbuf := bytes.NewReader(buf.Bytes())
+		log.Println("putlast", buf.Len())
+		part, err := multi.PutPart(len(parts)+1, rdbuf)
+		if err != nil {
+			log.Fatal("PutPart(last) ", err)
+		}
 		parts = append(parts, part)
+		buf.Reset()
 	}
 	err = multi.Complete(parts)
 	log.Println("complete", err)
@@ -566,13 +641,16 @@ func listlocal(basedir string) map[string]entry {
 	return rst
 }
 
-func lists3(s3url string) map[string]entry {
+func lists3(s3url string, delimiter string) map[string]entry {
 	rst := map[string]entry{}
 	bkt, prefix, err := url2bktpath(s3cl, s3url)
 	if err != nil {
 		log.Fatal("invalid url:", err)
 	}
-	prefix = strings.TrimSuffix(prefix, "/") + "/"
+	prefix = strings.TrimSuffix(prefix, delimiter)
+	if prefix != "" {
+		prefix = prefix + delimiter
+	}
 	var marker string
 	for {
 		rsp, err := bkt.List(prefix, "", marker, 1000)
@@ -632,7 +710,7 @@ func syncto(s3url, basedir string, check_content, do_del bool) {
 	src := listlocal(basedir)
 	log.Println("local", src)
 	// list s3
-	dst := lists3(s3url)
+	dst := lists3(s3url, "/")
 	log.Println("s3", dst)
 	to_update, to_del := changelist(basedir, src, dst, check_content)
 	// put
@@ -678,7 +756,7 @@ func syncfrom(s3url, basedir string, check_content, do_del bool) {
 	dst := listlocal(basedir)
 	log.Println("local", dst)
 	// list s3
-	src := lists3(s3url)
+	src := lists3(s3url, "/")
 	log.Println("s3", src)
 	to_update, to_del := changelist(basedir, src, dst, check_content)
 	// get
@@ -692,10 +770,10 @@ func syncfrom(s3url, basedir string, check_content, do_del bool) {
 
 func syncremote(s3url_src, s3url_dst string, check_content, do_del bool) {
 	// list s3_src
-	src := lists3(s3url_src)
+	src := lists3(s3url_src, "/")
 	log.Println("s3src", src)
 	// list s3_dst
-	dst := lists3(s3url_dst)
+	dst := lists3(s3url_dst, "/")
 	log.Println("s3dst", dst)
 	to_update, to_del := changelist("", src, dst, check_content)
 	// putcopy
@@ -875,6 +953,11 @@ func main() {
 			ShortName: "dd",
 			Usage:     "read file from bucket",
 			Action:    cat,
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name: "recursive,R",
+				},
+			},
 		}, {
 			Name:      "getrange",
 			ShortName: "readrange",
@@ -931,6 +1014,10 @@ func main() {
 					Name:  "content-type,t",
 					Value: "binary/octet-stream",
 					Usage: "set content type",
+				},
+				cli.BoolFlag{
+					Name:  "dry-run,n",
+					Usage: "do not merge",
 				},
 			},
 		}, {

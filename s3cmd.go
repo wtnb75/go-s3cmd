@@ -19,6 +19,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -179,6 +180,9 @@ func exists(c *cli.Context) {
 		}
 		if r {
 			fmt.Println(us)
+		} else {
+			log.Println(us, "does not exists")
+			os.Exit(1)
 		}
 	}
 }
@@ -314,14 +318,36 @@ func cp(c *cli.Context) {
 		}
 		log.Printf("copy %s => s3://%s/%s", s, dstbkt.Name, dstkey)
 		res, err := dstbkt.PutCopy(dstkey, s3.Private, s3.CopyOptions{}, fmt.Sprintf("/%s/%s", srcbkt.Name, srckey))
-		log.Println("putcopy", res, err)
+		if err != nil {
+			log.Println("putcopy", res, err)
+		}
 	}
 }
 
 func del(c *cli.Context) {
 	setup(c)
 	args := c.Args()
-	log.Println("args", args)
+	for _, s := range args {
+		if c.Bool("recursive") {
+			res := lists3(s, "")
+			objs := s3.Delete{Quiet: true}
+			for k, _ := range res {
+				urltodel := s + k
+				_, key, _ := url2bktpath(s3cl, urltodel)
+				objs.Objects = append(objs.Objects, s3.Object{Key: key})
+			}
+			bkt, _, err := url2bktpath(s3cl, s)
+			err = bkt.DelMulti(objs)
+			log.Println("delmulti", err)
+		} else {
+			bkt, key, err := url2bktpath(s3cl, s)
+			if err != nil {
+				log.Fatal("url parse ", s, err)
+			}
+			err = bkt.Del(key)
+			log.Println("delete:", s, err)
+		}
+	}
 }
 
 func du(c *cli.Context) {
@@ -448,6 +474,21 @@ func listmulti(c *cli.Context) {
 	}
 }
 
+func putpart_sub(parts []s3.Part, multi *s3.Multi, buf *bytes.Buffer) ([]s3.Part, error) {
+	if buf.Len() == 0 {
+		return parts, nil
+	}
+	rdbuf := bytes.NewReader(buf.Bytes())
+	log.Println("putpart", len(parts), buf.Len())
+	part, err := multi.PutPart(len(parts)+1, rdbuf)
+	if err != nil {
+		return parts, err
+	}
+	parts = append(parts, part)
+	buf.Reset()
+	return parts, nil
+}
+
 func merge(c *cli.Context) {
 	setup(c)
 	args := c.Args()
@@ -490,23 +531,23 @@ func merge(c *cli.Context) {
 	if c.Bool("dry-run") {
 		return
 	}
+	urllist := []string{}
+	for k, _ := range srcurls {
+		urllist = append(urllist, k)
+	}
+	sort.Strings(urllist)
 	var buf bytes.Buffer
 	parts := []s3.Part{}
 	multi, err := dstbkt.InitMulti(dstbase, c.String("content-type"), s3.Private, s3.Options{})
 	if err != nil {
 		log.Fatal("init multi ", dstbase, err)
 	}
-	for s, v := range srcurls {
+	for _, s := range urllist {
+		v := srcurls[s]
 		if v.size > 5*1024*1024 {
-			if buf.Len() != 0 {
-				rdbuf := bytes.NewReader(buf.Bytes())
-				log.Println("put", buf.Len())
-				part, err := multi.PutPart(len(parts)+1, rdbuf)
-				if err != nil {
-					log.Fatal("PutPart ", err)
-				}
-				parts = append(parts, part)
-				buf.Reset()
+			parts, err = putpart_sub(parts, multi, &buf)
+			if err != nil {
+				log.Fatal("putpart ", err)
 			}
 			srcbkt, srcbase, err := url2bktpath(s3cl, s)
 			if err != nil {
@@ -519,22 +560,23 @@ func merge(c *cli.Context) {
 				log.Fatal("PutPartCopy ", s, err, res)
 			}
 			parts = append(parts, part)
-		}
-		log.Println("read", s)
-		rsz, err := buf.ReadFrom(reader_s3(s3cl, s, make(http.Header)))
-		if rsz != v.size || err != nil {
-			log.Fatal("copy error ", s, rsz, err)
+		} else {
+			log.Println("read", s)
+			rsz, err := buf.ReadFrom(reader_s3(s3cl, s, make(http.Header)))
+			if rsz != v.size || err != nil {
+				log.Fatal("copy error ", s, rsz, err)
+			}
+			if buf.Len() > 8*1024*1024 {
+				parts, err = putpart_sub(parts, multi, &buf)
+				if err != nil {
+					log.Fatal("putpartsub ", err)
+				}
+			}
 		}
 	}
-	if buf.Len() != 0 {
-		rdbuf := bytes.NewReader(buf.Bytes())
-		log.Println("putlast", buf.Len())
-		part, err := multi.PutPart(len(parts)+1, rdbuf)
-		if err != nil {
-			log.Fatal("PutPart(last) ", err)
-		}
-		parts = append(parts, part)
-		buf.Reset()
+	parts, err = putpart_sub(parts, multi, &buf)
+	if err != nil {
+		log.Fatal("PutPart(last) ", err)
 	}
 	err = multi.Complete(parts)
 	log.Println("complete", err)
@@ -982,6 +1024,11 @@ func main() {
 			ShortName: "rm",
 			Usage:     "delete object",
 			Action:    del,
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name: "recursive,R",
+				},
+			},
 		}, {
 			Name:      "copy",
 			ShortName: "cp",

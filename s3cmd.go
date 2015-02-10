@@ -7,9 +7,9 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"github.com/AdRoll/goamz/aws"
+	"github.com/AdRoll/goamz/s3"
 	"github.com/codegangsta/cli"
-	"github.com/crowdmob/goamz/aws"
-	"github.com/crowdmob/goamz/s3"
 	"github.com/vaughan0/go-ini"
 	"io"
 	"log"
@@ -544,7 +544,7 @@ func merge(c *cli.Context) {
 	}
 	for _, s := range urllist {
 		v := srcurls[s]
-		if v.size > 5*1024*1024 {
+		if v.size > 5*1024*1024 && buf.Len() > 5*1024*1024 {
 			parts, err = putpart_sub(parts, multi, &buf)
 			if err != nil {
 				log.Fatal("putpart ", err)
@@ -871,21 +871,24 @@ func setup(c *cli.Context) {
 		}
 		akey, _ = conf.Get("default", "access_key")
 		skey, _ = conf.Get("default", "secret_key")
-	} else {
+	}
+	if c.GlobalString("access_key") != "" {
 		akey = c.GlobalString("access_key")
+	}
+	if c.GlobalString("secret_key") != "" {
 		skey = c.GlobalString("secret_key")
-		if c.GlobalString("region") != "" {
-			reg = aws.Regions[c.GlobalString("region")]
-		}
-		if c.GlobalString("endpoint") != "" {
-			reg.Name = "customized"
-			reg.S3Endpoint = c.GlobalString("endpoint")
-		}
-		if c.GlobalBool("force_path_style") {
-			u, _ := url.Parse(reg.S3Endpoint)
-			u.Host = "${bucket}." + u.Host
-			reg.S3BucketEndpoint = u.String()
-		}
+	}
+	if c.GlobalString("region") != "" {
+		reg = aws.Regions[c.GlobalString("region")]
+	}
+	if c.GlobalString("endpoint") != "" {
+		reg.Name = "customized"
+		reg.S3Endpoint = c.GlobalString("endpoint")
+	}
+	if c.GlobalBool("force_path_style") {
+		u, _ := url.Parse(reg.S3Endpoint)
+		u.Host = "${bucket}." + u.Host
+		reg.S3BucketEndpoint = u.String()
 	}
 	if auth, err := aws.GetAuth(akey, skey, "", time.Now().Add(time.Hour)); err == nil {
 		s3cl = s3.New(auth, reg)

@@ -291,7 +291,10 @@ func put(c *cli.Context) {
 			fmt.Printf("start put %s => s3://%s/%s\n", s, dstbkt.Name, dstkey)
 			fi, _ := ifp.Stat()
 			st := time.Now()
-			dstbkt.PutReader(dstkey, ifp, fi.Size(), ctyp, s3.Private, s3.Options{})
+			err = dstbkt.PutReader(dstkey, ifp, fi.Size(), ctyp, s3.Private, s3.Options{})
+			if err != nil {
+				log.Println("put error", err)
+			}
 			ifp.Close()
 			fmt.Println("finished", time.Since(st), fi.Size())
 		}

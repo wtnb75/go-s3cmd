@@ -539,6 +539,19 @@ func merge(c *cli.Context) {
 		urllist = append(urllist, k)
 	}
 	sort.Strings(urllist)
+	if len(urllist) == 0 {
+		log.Println("empty source")
+		return
+	}
+	if len(urllist) == 1 {
+		log.Println("single source")
+		srcbkt, srcbase, err := url2bktpath(s3cl, urllist[0])
+		res, err := dstbkt.PutCopy(dstbase, s3.Private, s3.CopyOptions{}, path.Join(srcbkt.Name, srcbase))
+		if err != nil {
+			log.Println("putcopy failed", err, res)
+		}
+		return
+	}
 	var buf bytes.Buffer
 	parts := []s3.Part{}
 	multi, err := dstbkt.InitMulti(dstbase, c.String("content-type"), s3.Private, s3.Options{})
@@ -547,7 +560,7 @@ func merge(c *cli.Context) {
 	}
 	for _, s := range urllist {
 		v := srcurls[s]
-		if v.size > 5*1024*1024 && buf.Len() > 5*1024*1024 {
+		if v.size > 5*1024*1024 && (buf.Len() == 0 || buf.Len() > 5*1024*1024) {
 			parts, err = putpart_sub(parts, multi, &buf)
 			if err != nil {
 				log.Fatal("putpart ", err)
@@ -564,12 +577,12 @@ func merge(c *cli.Context) {
 			}
 			parts = append(parts, part)
 		} else {
-			log.Println("read", s)
+			log.Println("read", s, v.size, buf.Len())
 			rsz, err := buf.ReadFrom(reader_s3(s3cl, s, make(http.Header)))
 			if rsz != v.size || err != nil {
 				log.Fatal("copy error ", s, rsz, err)
 			}
-			if buf.Len() > 8*1024*1024 {
+			if buf.Len() > 16*1024*1024 {
 				parts, err = putpart_sub(parts, multi, &buf)
 				if err != nil {
 					log.Fatal("putpartsub ", err)
@@ -577,12 +590,26 @@ func merge(c *cli.Context) {
 			}
 		}
 	}
-	parts, err = putpart_sub(parts, multi, &buf)
-	if err != nil {
-		log.Fatal("PutPart(last) ", err)
+	if len(parts) == 0 {
+		err = multi.Abort()
+		if err != nil {
+			log.Println("abort multi failed", err)
+		}
+		log.Println("single put", dstbkt.Name, dstbase)
+		err = dstbkt.Put(dstbase, buf.Bytes(), c.String("content-type"), s3.Private, s3.Options{})
+		if err != nil {
+			log.Println("put failed", err)
+		}
+	} else {
+		parts, err = putpart_sub(parts, multi, &buf)
+		if err != nil {
+			log.Fatal("PutPart(last) ", err)
+		}
+		err = multi.Complete(parts)
+		if err != nil {
+			log.Println("complete", err)
+		}
 	}
-	err = multi.Complete(parts)
-	log.Println("complete", err)
 }
 
 type aclpol struct {

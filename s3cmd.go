@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +14,7 @@ import (
 	"github.com/codegangsta/cli"
 	"github.com/vaughan0/go-ini"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -467,13 +470,76 @@ func listmulti(c *cli.Context) {
 	setup(c)
 	args := c.Args()
 	log.Println("list unfinished multipart uploads.")
+	delim := "/"
+	if c.Bool("recursive") {
+		delim = ""
+	}
 	for _, dst := range args {
 		dstbkt, dstbase, err := url2bktpath(s3cl, dst)
 		if err != nil {
 			log.Fatal("url parse ", dst, err)
 		}
-		multis, prefx, err := dstbkt.ListMulti(dstbase, "/")
-		log.Println("listmulti", dst, multis, prefx, err)
+		multis, prefx, err := dstbkt.ListMulti(dstbase, delim)
+		log.Println("listmulti", dstbkt.Name, dstbase, multis, prefx, err)
+		for _, v := range prefx {
+			lsshowd(dstbkt, v, c.Bool("longfmt"))
+		}
+		for _, v := range multis {
+			if c.Bool("longfmt") {
+				fmt.Printf("s3://%s/%s  %s\n", v.Bucket.Name, v.Key, v.UploadId)
+				if parts, err := v.ListParts(); err == nil {
+					var cursize int64
+					for _, part := range parts {
+						fmt.Printf("  part[%d]: ETag=%s Size=%d\n", part.N, part.ETag, part.Size)
+						cursize += part.Size
+					}
+					fmt.Printf("  current size: %d\n", cursize)
+				} else {
+					log.Println("listparts error", err)
+				}
+			} else {
+				fmt.Printf("s3://%s/%s\n", v.Bucket.Name, v.Key)
+			}
+		}
+	}
+}
+
+func cleanmulti(c *cli.Context) {
+	setup(c)
+	args := c.Args()
+	delim := "/"
+	if c.Bool("recursive") {
+		delim = ""
+	}
+	for _, dst := range args {
+		dstbkt, dstbase, err := url2bktpath(s3cl, dst)
+		if err != nil {
+			log.Fatal("url parse ", dst, err)
+		}
+		multis, prefx, err := dstbkt.ListMulti(dstbase, delim)
+		log.Println("listmulti", dstbkt.Name, dstbase, multis, prefx, err)
+		for _, v := range multis {
+			if c.String("id") != "" && v.UploadId != c.String("id") {
+				continue
+			}
+			if c.Bool("complete") {
+				if parts, err := v.ListParts(); err == nil {
+					log.Printf("complete upload s3://%s/%s  %s  %d parts", v.Bucket.Name, v.Key, v.UploadId, len(parts))
+					if err = v.Complete(parts); err != nil {
+						log.Println("complete failed", err)
+					} else {
+						log.Println("complete success.")
+					}
+				} else {
+					log.Println("listparts", err)
+				}
+			} else {
+				log.Printf("aborting upload s3://%s/%s  %s", v.Bucket.Name, v.Key, v.UploadId)
+				if err := v.Abort(); err != nil {
+					log.Println("abort failed", err)
+				}
+			}
+		}
 	}
 }
 
@@ -539,6 +605,19 @@ func merge(c *cli.Context) {
 		urllist = append(urllist, k)
 	}
 	sort.Strings(urllist)
+	if len(urllist) == 0 {
+		log.Println("empty source")
+		return
+	}
+	if len(urllist) == 1 {
+		log.Println("single source")
+		srcbkt, srcbase, err := url2bktpath(s3cl, urllist[0])
+		res, err := dstbkt.PutCopy(dstbase, s3.Private, s3.CopyOptions{}, path.Join(srcbkt.Name, srcbase))
+		if err != nil {
+			log.Println("putcopy failed", err, res)
+		}
+		return
+	}
 	var buf bytes.Buffer
 	parts := []s3.Part{}
 	multi, err := dstbkt.InitMulti(dstbase, c.String("content-type"), s3.Private, s3.Options{})
@@ -547,7 +626,7 @@ func merge(c *cli.Context) {
 	}
 	for _, s := range urllist {
 		v := srcurls[s]
-		if v.size > 5*1024*1024 && buf.Len() > 5*1024*1024 {
+		if v.size > 5*1024*1024 && (buf.Len() == 0 || buf.Len() > 5*1024*1024) {
 			parts, err = putpart_sub(parts, multi, &buf)
 			if err != nil {
 				log.Fatal("putpart ", err)
@@ -564,12 +643,12 @@ func merge(c *cli.Context) {
 			}
 			parts = append(parts, part)
 		} else {
-			log.Println("read", s)
+			log.Println("read", s, v.size, buf.Len())
 			rsz, err := buf.ReadFrom(reader_s3(s3cl, s, make(http.Header)))
 			if rsz != v.size || err != nil {
 				log.Fatal("copy error ", s, rsz, err)
 			}
-			if buf.Len() > 8*1024*1024 {
+			if buf.Len() > 16*1024*1024 {
 				parts, err = putpart_sub(parts, multi, &buf)
 				if err != nil {
 					log.Fatal("putpartsub ", err)
@@ -577,12 +656,26 @@ func merge(c *cli.Context) {
 			}
 		}
 	}
-	parts, err = putpart_sub(parts, multi, &buf)
-	if err != nil {
-		log.Fatal("PutPart(last) ", err)
+	if len(parts) == 0 {
+		err = multi.Abort()
+		if err != nil {
+			log.Println("abort multi failed", err)
+		}
+		log.Println("single put", dstbkt.Name, dstbase)
+		err = dstbkt.Put(dstbase, buf.Bytes(), c.String("content-type"), s3.Private, s3.Options{})
+		if err != nil {
+			log.Println("put failed", err)
+		}
+	} else {
+		parts, err = putpart_sub(parts, multi, &buf)
+		if err != nil {
+			log.Fatal("PutPart(last) ", err)
+		}
+		err = multi.Complete(parts)
+		if err != nil {
+			log.Println("complete", err)
+		}
 	}
-	err = multi.Complete(parts)
-	log.Println("complete", err)
 }
 
 type aclpol struct {
@@ -631,6 +724,109 @@ func setacl(c *cli.Context) {
 
 func mv(c *cli.Context) {
 	setup(c)
+}
+
+func save2tar(wr *tar.Writer, bkt *s3.Bucket, key s3.Key) error {
+	rsp, err := bkt.GetResponseWithHeaders(key.Key, http.Header{})
+	if err != nil || rsp == nil {
+		log.Println("get error", bkt.Name, key.Key, err, rsp)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("null response")
+	}
+	hdr := new(tar.Header)
+	hdr.Name = bkt.Name + "/" + key.Key
+	hdr.Mode = 0644
+	hdr.Xattrs = make(map[string]string)
+	for k, v := range rsp.Header {
+		vv := strings.Join(v, " ")
+		hdr.Xattrs["s3.header."+k] = vv
+		switch strings.ToLower(k) {
+		case "last-modified":
+			if hdr.ModTime, err = time.Parse(time.RFC1123, vv); err != nil {
+				log.Println("time.parse(lastmod)", vv, err)
+			}
+		case "date", "x-amz-date":
+			if hdr.AccessTime, err = time.Parse(time.RFC1123, vv); err != nil {
+				log.Println("time.parse(date)", vv, err)
+			}
+		}
+	}
+	var rd io.Reader
+	if rsp.ContentLength != -1 {
+		rd = rsp.Body
+		hdr.Size = rsp.ContentLength
+	} else {
+		if bt, err := ioutil.ReadAll(rsp.Body); err == nil {
+			rd = bytes.NewReader(bt)
+			hdr.Size = int64(len(bt))
+		} else {
+			log.Println("read", err)
+			return err
+		}
+	}
+	if err = wr.WriteHeader(hdr); err != nil {
+		log.Println("header write", err)
+		return err
+	}
+	if cnt, err := io.Copy(wr, rd); err != nil {
+		log.Println("copy", err, cnt)
+		return err
+	} else if cnt != hdr.Size {
+		log.Println("short copy?", cnt, hdr.Size)
+		return fmt.Errorf("short copy copied %d != size %d", cnt, hdr.Size)
+	}
+	return nil
+}
+
+func tarsave(c *cli.Context) {
+	setup(c)
+	var out io.Writer
+	out = os.Stdout
+	if c.String("file") != "" {
+		fp, err := os.Create(c.String("file"))
+		if err != nil {
+			log.Println("open file", err)
+			return
+		}
+		defer fp.Close()
+		out = fp
+	}
+	if c.Bool("gzip") {
+		gzwr := gzip.NewWriter(out)
+		defer gzwr.Close()
+		defer gzwr.Flush()
+		out = gzwr
+	}
+	wr := tar.NewWriter(out)
+	for _, arg := range c.Args() {
+		bkt, prefix, err := url2bktpath(s3cl, arg)
+		if err != nil {
+			log.Println("invalid argument:", arg)
+			continue
+		}
+		var marker string
+		for {
+			rsp, err := bkt.List(prefix, "", marker, 1000)
+			if err != nil {
+				log.Println("error List", err)
+				break
+			}
+			for _, k := range rsp.Contents {
+				if err = save2tar(wr, bkt, k); err != nil {
+					log.Println("save error", err)
+					break
+				}
+			}
+			marker = rsp.NextMarker
+			if !rsp.IsTruncated {
+				break
+			}
+		}
+	}
+	wr.Flush()
+	wr.Close()
 }
 
 func sync(c *cli.Context) {
@@ -707,6 +903,9 @@ func lists3(s3url string, delimiter string) map[string]entry {
 		for _, k := range rsp.Contents {
 			keystr := strings.TrimPrefix(k.Key, prefix)
 			lm, _ := time.Parse("2006-01-02T15:04:05.000Z07:00", k.LastModified)
+			if strings.HasSuffix(keystr, "_$folder$") && k.Size == 0 {
+				continue
+			}
 			rst[keystr] = entry{size: k.Size, cksum: strings.Trim(k.ETag, "\""), lastmod: lm}
 		}
 		marker = rsp.NextMarker
@@ -805,7 +1004,35 @@ func syncfrom(s3url, basedir string, check_content, do_del bool) {
 	log.Println("s3", src)
 	to_update, to_del := changelist(basedir, src, dst, check_content)
 	// get
-	log.Println("get", to_update)
+	bkt, prefix, err := url2bktpath(s3cl, s3url)
+	if err != nil {
+		log.Println("url error", err)
+	}
+	log.Println("get", len(to_update), "files")
+	for _, k := range to_update {
+		dstname := filepath.Join(basedir, k)
+		srcname := filepath.Join(prefix, k)
+		us := fmt.Sprintf("s3://%s/%s", bkt.Name, srcname)
+		log.Println("get", us, dstname)
+		outf, err := os.Create(dstname)
+		if err != nil {
+			err = os.MkdirAll(filepath.Dir(dstname), 0777)
+			if err != nil {
+				log.Println("mkdir failed", err)
+			}
+			outf, err = os.Create(dstname)
+		}
+		if err != nil {
+			log.Println("open failed", us, dstname, err)
+			continue
+		}
+		st := time.Now()
+		rd := reader_s3(s3cl, us, make(http.Header))
+		ncp, _ := io.Copy(outf, rd)
+		outf.Close()
+		rd.Close()
+		log.Println("finished", time.Since(st), ncp)
+	}
 	if !do_del {
 		return
 	}
@@ -839,7 +1066,7 @@ func setup(c *cli.Context) {
 		var conf Config
 		err = dec.Decode(&conf)
 		if err != nil {
-			log.Fatal("json decode %+v %v", conf, err)
+			log.Fatal("json decode ", conf, err)
 		}
 		if conf.Debug {
 			verbose = true
@@ -1096,6 +1323,33 @@ func main() {
 			ShortName: "lm",
 			Usage:     "list ongoing multipart upload",
 			Action:    listmulti,
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name: "longfmt,l",
+				},
+				cli.BoolFlag{
+					Name: "recursive,R",
+				},
+			},
+		}, {
+			Name:      "cleanmulti",
+			ShortName: "cm",
+			Usage:     "abort ongoing multipart upload",
+			Action:    cleanmulti,
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "recursive,R",
+					Usage: "abort all Uploads",
+				},
+				cli.BoolFlag{
+					Name:  "complete,commit,finish",
+					Usage: "does not Abort, do Commit",
+				},
+				cli.StringFlag{
+					Name:  "id,i",
+					Usage: "specify UploadId",
+				},
+			},
 		}, {
 			Name:   "info",
 			Usage:  "get info",
@@ -1130,6 +1384,23 @@ func main() {
 				cli.BoolFlag{
 					Name:  "size-only,s",
 					Usage: "compare only size",
+				},
+			},
+		}, {
+			Name:   "tar",
+			Usage:  "download to tar archive",
+			Action: tarsave,
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "gzip,z",
+					Usage: "compress output",
+				},
+				cli.StringFlag{
+					Name: "use-compress-program",
+				},
+				cli.StringFlag{
+					Name:  "file,f",
+					Usage: "output file",
 				},
 			},
 		},

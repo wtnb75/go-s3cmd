@@ -13,6 +13,7 @@ import (
 	"github.com/AdRoll/goamz/s3"
 	"github.com/codegangsta/cli"
 	"github.com/vaughan0/go-ini"
+	"github.com/wtnb75/go-cmdrepl"
 	"io"
 	"io/ioutil"
 	"log"
@@ -138,6 +139,36 @@ func ls(c *cli.Context) {
 				if !rsp.IsTruncated {
 					break
 				}
+			}
+		}
+	}
+}
+
+func geturl(c *cli.Context) {
+	setup(c)
+	for _, us := range c.Args() {
+		bkt, prefix, err := url2bktpath(s3cl, us)
+		if err != nil {
+			log.Fatal("invalid url:", err)
+		}
+		var marker string
+		delim := "/"
+		if c.Bool("recursive") {
+			delim = ""
+		}
+		for {
+			rsp, err := bkt.List(prefix, delim, marker, 1000)
+			if err != nil {
+				log.Println("error List", err)
+				break
+			}
+			for _, k := range rsp.Contents {
+				// log.Printf("%+v\n", k)
+				fmt.Println(bkt.SignedURL(k.Key, time.Now().Add(c.Duration("expires"))))
+			}
+			marker = rsp.NextMarker
+			if !rsp.IsTruncated {
+				break
 			}
 		}
 	}
@@ -722,6 +753,10 @@ func setacl(c *cli.Context) {
 	setup(c)
 }
 
+func getacl(c *cli.Context) {
+	setup(c)
+}
+
 func mv(c *cli.Context) {
 	setup(c)
 }
@@ -1066,7 +1101,7 @@ func setup(c *cli.Context) {
 		var conf Config
 		err = dec.Decode(&conf)
 		if err != nil {
-			log.Fatal("json decode ", conf, err)
+			log.Fatal("json decode %+v %v", conf, err)
 		}
 		if conf.Debug {
 			verbose = true
@@ -1143,7 +1178,7 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "config, c",
-			Value: path.Join(homedir, ".dagrin", "credential.json"),
+			Value: path.Join(homedir, ".dag", "credential.json"),
 			Usage: "config file",
 		},
 		cli.StringFlag{
@@ -1193,6 +1228,20 @@ func main() {
 				},
 				cli.BoolFlag{
 					Name: "recursive,R",
+				},
+			},
+		}, {
+			Name:      "list-url",
+			ShortName: "url",
+			Usage:     "list object url",
+			Action:    geturl,
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name: "recursive,R",
+				},
+				cli.DurationFlag{
+					Name:  "expires",
+					Value: time.Hour * 1,
 				},
 			},
 		}, {
@@ -1359,6 +1408,10 @@ func main() {
 			Usage:  "set acl",
 			Action: setacl,
 		}, {
+			Name:   "getacl",
+			Usage:  "get acl",
+			Action: getacl,
+		}, {
 			Name:   "mv",
 			Usage:  "move object",
 			Action: mv,
@@ -1405,5 +1458,9 @@ func main() {
 			},
 		},
 	}
-	app.Run(os.Args)
+	if len(os.Args) == 1 {
+		cmdrepl.CmdRepl("s3cmd> ", app)
+	} else {
+		app.Run(os.Args)
+	}
 }

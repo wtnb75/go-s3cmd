@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -864,7 +865,64 @@ func tarsave(c *cli.Context) {
 	wr.Close()
 }
 
-func sync(c *cli.Context) {
+type SyncEntry struct {
+	From string
+	To   string
+}
+
+func sync_routine(ch chan *SyncEntry, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		ent := <-ch
+		if ent == nil {
+			ch <- nil
+			break
+		}
+		srcbkt, srckey, srcerr := url2bktpath(s3cl, ent.From)
+		dstbkt, dstkey, dsterr := url2bktpath(s3cl, ent.To)
+		if srcerr == nil && dsterr == nil {
+			// remote copy
+			log.Println("cp", ent)
+			res, err := dstbkt.PutCopy(dstkey, s3.Private, s3.CopyOptions{}, fmt.Sprintf("/%s/%s", srcbkt.Name, srckey))
+			if err != nil {
+				log.Println("putcopy", res, err)
+			}
+		} else if srcerr == nil && dsterr != nil {
+			// sync from s3
+			log.Println("get", ent)
+			outf, err := os.Create(ent.To)
+			if err != nil {
+				err = os.MkdirAll(filepath.Dir(ent.To), 0777)
+				if err != nil {
+					log.Println("mkdir failed", err)
+				}
+				outf, err = os.Create(ent.To)
+			}
+			st := time.Now()
+			rd := reader_s3(s3cl, ent.From, make(http.Header))
+			ncp, _ := io.Copy(outf, rd)
+			outf.Close()
+			rd.Close()
+			log.Println("finished", time.Since(st), ncp)
+		} else if srcerr != nil && dsterr == nil {
+			// sync to s3
+			log.Println("put", ent)
+			st := time.Now()
+			if ifp, err := os.Open(ent.From); err == nil {
+				fi, _ := ifp.Stat()
+				dstbkt.PutReader(dstkey, ifp, fi.Size(), "application/octet-stream", s3.Private, s3.Options{})
+				ifp.Close()
+				log.Println("finished", time.Since(st), fi.Size())
+			} else {
+				log.Println("open failed", err)
+			}
+		} else {
+			// sync local?
+		}
+	}
+}
+
+func synccmd(c *cli.Context) {
 	setup(c)
 	check_content := !c.Bool("size-only")
 	do_del := c.Bool("delete")
@@ -872,15 +930,28 @@ func sync(c *cli.Context) {
 	dst := c.Args().Get(1)
 	_, _, srcerr := url2bktpath(s3cl, src)
 	_, _, dsterr := url2bktpath(s3cl, dst)
+	var wg sync.WaitGroup
+	ch := make(chan *SyncEntry, c.Int("parallel"))
+	log.Println("boot routine", c.Int("parallel"))
+	for i := 0; i < c.Int("parallel"); i++ {
+		wg.Add(1)
+		go sync_routine(ch, &wg)
+	}
+	defer wg.Wait()
 	if srcerr == nil && dsterr != nil {
-		syncfrom(src, dst, check_content, do_del)
+		log.Println("syncfrom")
+		syncfrom(src, dst, check_content, do_del, ch)
 	} else if srcerr != nil && dsterr == nil {
-		syncto(dst, src, check_content, do_del)
+		log.Println("syncto")
+		syncto(dst, src, check_content, do_del, ch)
 	} else if srcerr == nil && dsterr == nil {
-		syncremote(src, dst, check_content, do_del)
+		log.Println("syncremote")
+		syncremote(src, dst, check_content, do_del, ch)
 	} else {
 		log.Fatal("src and dst are not s3 url ", src, dst)
 	}
+	ch <- nil
+	log.Println("wait finish")
 }
 
 type entry struct {
@@ -902,6 +973,9 @@ func filemd5(fn string) (string, error) {
 
 func listlocal(basedir string) map[string]entry {
 	rst := map[string]entry{}
+	if _, err := os.Stat(basedir); os.IsNotExist(err) {
+		return rst
+	}
 	filepath.Walk(basedir, func(pathname string, info os.FileInfo, err error) error {
 		if !strings.HasPrefix(pathname, basedir) {
 			log.Println("invalid path?", pathname, basedir)
@@ -938,7 +1012,7 @@ func lists3(s3url string, delimiter string) map[string]entry {
 		for _, k := range rsp.Contents {
 			keystr := strings.TrimPrefix(k.Key, prefix)
 			lm, _ := time.Parse("2006-01-02T15:04:05.000Z07:00", k.LastModified)
-			if strings.HasSuffix(keystr, "_$folder$") && k.Size == 0 {
+			if (strings.HasSuffix(keystr, "_$folder$") || strings.HasSuffix(keystr, "/")) && k.Size == 0 {
 				continue
 			}
 			rst[keystr] = entry{size: k.Size, cksum: strings.Trim(k.ETag, "\""), lastmod: lm}
@@ -984,7 +1058,7 @@ func changelist(basedir string, src, dst map[string]entry, check_content bool) (
 	return
 }
 
-func syncto(s3url, basedir string, check_content, do_del bool) {
+func syncto(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntry) {
 	// list localdir
 	src := listlocal(basedir)
 	log.Println("local", src)
@@ -999,18 +1073,9 @@ func syncto(s3url, basedir string, check_content, do_del bool) {
 	}
 	log.Println("put", len(to_update), "files")
 	for _, k := range to_update {
-		dstname := filepath.Join(prefix, k)
+		dstname := fmt.Sprintf("s3://%s/%s", bkt.Name, filepath.Join(prefix, k))
 		srcname := filepath.Join(basedir, k)
-		log.Println("put", bkt.Name, srcname, dstname)
-		st := time.Now()
-		if ifp, err := os.Open(srcname); err == nil {
-			fi, _ := ifp.Stat()
-			bkt.PutReader(dstname, ifp, fi.Size(), "application/octet-stream", s3.Private, s3.Options{})
-			ifp.Close()
-			log.Println("finished", time.Since(st), fi.Size())
-		} else {
-			log.Println("open failed", err)
-		}
+		ch <- &SyncEntry{From: srcname, To: dstname}
 	}
 	if !do_del {
 		return
@@ -1030,7 +1095,7 @@ func syncto(s3url, basedir string, check_content, do_del bool) {
 	}
 }
 
-func syncfrom(s3url, basedir string, check_content, do_del bool) {
+func syncfrom(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntry) {
 	// list localdir
 	dst := listlocal(basedir)
 	log.Println("local", dst)
@@ -1048,25 +1113,7 @@ func syncfrom(s3url, basedir string, check_content, do_del bool) {
 		dstname := filepath.Join(basedir, k)
 		srcname := filepath.Join(prefix, k)
 		us := fmt.Sprintf("s3://%s/%s", bkt.Name, srcname)
-		log.Println("get", us, dstname)
-		outf, err := os.Create(dstname)
-		if err != nil {
-			err = os.MkdirAll(filepath.Dir(dstname), 0777)
-			if err != nil {
-				log.Println("mkdir failed", err)
-			}
-			outf, err = os.Create(dstname)
-		}
-		if err != nil {
-			log.Println("open failed", us, dstname, err)
-			continue
-		}
-		st := time.Now()
-		rd := reader_s3(s3cl, us, make(http.Header))
-		ncp, _ := io.Copy(outf, rd)
-		outf.Close()
-		rd.Close()
-		log.Println("finished", time.Since(st), ncp)
+		ch <- &SyncEntry{From: us, To: dstname}
 	}
 	if !do_del {
 		return
@@ -1075,7 +1122,7 @@ func syncfrom(s3url, basedir string, check_content, do_del bool) {
 	log.Println("unlink", to_del)
 }
 
-func syncremote(s3url_src, s3url_dst string, check_content, do_del bool) {
+func syncremote(s3url_src, s3url_dst string, check_content, do_del bool, ch chan *SyncEntry) {
 	// list s3_src
 	src := lists3(s3url_src, "/")
 	log.Println("s3src", src)
@@ -1085,6 +1132,11 @@ func syncremote(s3url_src, s3url_dst string, check_content, do_del bool) {
 	to_update, to_del := changelist("", src, dst, check_content)
 	// putcopy
 	log.Println("putcopy", to_update)
+	for _, k := range to_update {
+		dsturl := fmt.Sprintf("%s/%s", s3url_dst, k)
+		srcurl := fmt.Sprintf("%s/%s", s3url_src, k)
+		ch <- &SyncEntry{From: srcurl, To: dsturl}
+	}
 	if !do_del {
 		return
 	}
@@ -1418,7 +1470,7 @@ func main() {
 		}, {
 			Name:   "sync",
 			Usage:  "sync directory tree",
-			Action: sync,
+			Action: synccmd,
 			Flags: []cli.Flag{
 				cli.StringFlag{
 					Name:  "content-type,t",
@@ -1437,6 +1489,14 @@ func main() {
 				cli.BoolFlag{
 					Name:  "size-only,s",
 					Usage: "compare only size",
+				},
+				cli.BoolFlag{
+					Name: "dry-run,n",
+				},
+				cli.IntFlag{
+					Name:  "parallel,p",
+					Usage: "parallel upload/download",
+					Value: 1,
 				},
 			},
 		}, {

@@ -870,13 +870,17 @@ type SyncEntry struct {
 	To   string
 }
 
-func sync_routine(ch chan *SyncEntry, wg *sync.WaitGroup) {
+func sync_routine(ch chan *SyncEntry, wg *sync.WaitGroup, dry bool) {
 	defer wg.Done()
 	for {
 		ent := <-ch
 		if ent == nil {
 			ch <- nil
 			break
+		}
+		if dry {
+			log.Println("copy", ent)
+			continue
 		}
 		srcbkt, srckey, srcerr := url2bktpath(s3cl, ent.From)
 		dstbkt, dstkey, dsterr := url2bktpath(s3cl, ent.To)
@@ -935,18 +939,18 @@ func synccmd(c *cli.Context) {
 	log.Println("boot routine", c.Int("parallel"))
 	for i := 0; i < c.Int("parallel"); i++ {
 		wg.Add(1)
-		go sync_routine(ch, &wg)
+		go sync_routine(ch, &wg, c.Bool("dry-run"))
 	}
 	defer wg.Wait()
 	if srcerr == nil && dsterr != nil {
 		log.Println("syncfrom")
-		syncfrom(src, dst, check_content, do_del, ch)
+		syncfrom(src, dst, check_content, do_del, ch, c.Bool("dry-run"))
 	} else if srcerr != nil && dsterr == nil {
 		log.Println("syncto")
-		syncto(dst, src, check_content, do_del, ch)
+		syncto(dst, src, check_content, do_del, ch, c.Bool("dry-run"))
 	} else if srcerr == nil && dsterr == nil {
 		log.Println("syncremote")
-		syncremote(src, dst, check_content, do_del, ch)
+		syncremote(src, dst, check_content, do_del, ch, c.Bool("dry-run"))
 	} else {
 		log.Fatal("src and dst are not s3 url ", src, dst)
 	}
@@ -1058,7 +1062,7 @@ func changelist(basedir string, src, dst map[string]entry, check_content bool) (
 	return
 }
 
-func syncto(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntry) {
+func syncto(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntry, dry bool) {
 	// list localdir
 	src := listlocal(basedir)
 	log.Println("local", src)
@@ -1082,6 +1086,9 @@ func syncto(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntr
 	}
 	// del
 	log.Println("del", len(to_del), "objects")
+	if dry {
+		return
+	}
 	s3d := s3.Delete{}
 	s3d.Quiet = true
 	for _, k := range to_del {
@@ -1095,7 +1102,7 @@ func syncto(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntr
 	}
 }
 
-func syncfrom(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntry) {
+func syncfrom(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntry, dry bool) {
 	// list localdir
 	dst := listlocal(basedir)
 	log.Println("local", dst)
@@ -1120,9 +1127,16 @@ func syncfrom(s3url, basedir string, check_content, do_del bool, ch chan *SyncEn
 	}
 	// unlink
 	log.Println("unlink", to_del)
+	if dry {
+		return
+	}
+	for _, k := range to_del {
+		delname := filepath.Join(basedir, k)
+		os.Remove(delname)
+	}
 }
 
-func syncremote(s3url_src, s3url_dst string, check_content, do_del bool, ch chan *SyncEntry) {
+func syncremote(s3url_src, s3url_dst string, check_content, do_del bool, ch chan *SyncEntry, dry bool) {
 	// list s3_src
 	src := lists3(s3url_src, "/")
 	log.Println("s3src", src)
@@ -1142,6 +1156,21 @@ func syncremote(s3url_src, s3url_dst string, check_content, do_del bool, ch chan
 	}
 	// delete
 	log.Println("del", to_del)
+	if dry {
+		return
+	}
+	s3d := s3.Delete{}
+	s3d.Quiet = true
+	dstbkt, dstprefix, _ := url2bktpath(s3cl, s3url_dst)
+	for _, k := range to_del {
+		delname := filepath.Join(dstprefix, k)
+		s3d.Objects = append(s3d.Objects, s3.Object{Key: delname})
+		log.Println("del", dstbkt.Name, delname)
+	}
+	if len(s3d.Objects) != 0 {
+		log.Println("emit del")
+		dstbkt.DelMulti(s3d)
+	}
 }
 
 func setup(c *cli.Context) {

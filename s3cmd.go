@@ -1059,6 +1059,8 @@ func changelist(basedir string, src, dst map[string]entry, check_content bool) (
 		}
 		to_del = append(to_del, k)
 	}
+	sort.Strings(to_update)
+	sort.Strings(to_del)
 	return
 }
 

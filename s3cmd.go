@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"github.com/AdRoll/goamz/aws"
 	"github.com/AdRoll/goamz/s3"
+	"github.com/cheggaaa/pb"
 	"github.com/codegangsta/cli"
 	"github.com/vaughan0/go-ini"
 	"github.com/wtnb75/go-cmdrepl"
@@ -870,6 +871,8 @@ type SyncEntry struct {
 	To   string
 }
 
+var pbar *pb.ProgressBar
+
 func sync_routine(ch chan *SyncEntry, wg *sync.WaitGroup, dry bool) {
 	defer wg.Done()
 	for {
@@ -886,14 +889,15 @@ func sync_routine(ch chan *SyncEntry, wg *sync.WaitGroup, dry bool) {
 		dstbkt, dstkey, dsterr := url2bktpath(s3cl, ent.To)
 		if srcerr == nil && dsterr == nil {
 			// remote copy
-			log.Println("cp", ent)
+			// log.Println("cp", ent)
 			res, err := dstbkt.PutCopy(dstkey, s3.Private, s3.CopyOptions{}, fmt.Sprintf("/%s/%s", srcbkt.Name, srckey))
 			if err != nil {
 				log.Println("putcopy", res, err)
 			}
+			pbar.Increment()
 		} else if srcerr == nil && dsterr != nil {
 			// sync from s3
-			log.Println("get", ent)
+			// log.Println("get", ent)
 			outf, err := os.Create(ent.To)
 			if err != nil {
 				err = os.MkdirAll(filepath.Dir(ent.To), 0777)
@@ -902,21 +906,23 @@ func sync_routine(ch chan *SyncEntry, wg *sync.WaitGroup, dry bool) {
 				}
 				outf, err = os.Create(ent.To)
 			}
-			st := time.Now()
+			// st := time.Now()
 			rd := reader_s3(s3cl, ent.From, make(http.Header))
 			ncp, _ := io.Copy(outf, rd)
 			outf.Close()
 			rd.Close()
-			log.Println("finished", time.Since(st), ncp)
+			pbar.Add64(ncp)
+			// log.Println("finished", time.Since(st), ncp)
 		} else if srcerr != nil && dsterr == nil {
 			// sync to s3
-			log.Println("put", ent)
-			st := time.Now()
+			// log.Println("put", ent)
+			// st := time.Now()
 			if ifp, err := os.Open(ent.From); err == nil {
 				fi, _ := ifp.Stat()
 				dstbkt.PutReader(dstkey, ifp, fi.Size(), "application/octet-stream", s3.Private, s3.Options{})
 				ifp.Close()
-				log.Println("finished", time.Since(st), fi.Size())
+				// log.Println("finished", time.Since(st), fi.Size())
+				pbar.Add64(fi.Size())
 			} else {
 				log.Println("open failed", err)
 			}
@@ -1029,7 +1035,7 @@ func lists3(s3url string, delimiter string) map[string]entry {
 	return rst
 }
 
-func changelist(basedir string, src, dst map[string]entry, check_content bool) (to_update []string, to_del []string) {
+func changelist(basedir string, src, dst map[string]entry, check_content bool) (to_update []string, to_del []string, updatesz int64) {
 	to_update = []string{}
 	to_del = []string{}
 	for k, s := range src {
@@ -1052,6 +1058,7 @@ func changelist(basedir string, src, dst map[string]entry, check_content bool) (
 			}
 		}
 		to_update = append(to_update, k)
+		updatesz += s.size
 	}
 	for k, _ := range dst {
 		if _, ok := src[k]; ok {
@@ -1067,17 +1074,22 @@ func changelist(basedir string, src, dst map[string]entry, check_content bool) (
 func syncto(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntry, dry bool) {
 	// list localdir
 	src := listlocal(basedir)
-	log.Println("local", src)
+	log.Println("local", len(src), "files")
 	// list s3
 	dst := lists3(s3url, "/")
-	log.Println("s3", dst)
-	to_update, to_del := changelist(basedir, src, dst, check_content)
+	log.Println("s3", len(dst), "files")
+	to_update, to_del, usize := changelist(basedir, src, dst, check_content)
+	pbar = pb.New64(usize)
+	pbar.ShowSpeed = true
+	pbar.SetUnits(pb.U_BYTES)
+	pbar.Start()
+	defer pbar.Finish()
 	// put
 	bkt, prefix, err := url2bktpath(s3cl, s3url)
 	if err != nil {
 		log.Println("url error", err)
 	}
-	log.Println("put", len(to_update), "files")
+	log.Println("put", len(to_update), "files", len(to_del))
 	for _, k := range to_update {
 		dstname := fmt.Sprintf("s3://%s/%s", bkt.Name, filepath.Join(prefix, k))
 		srcname := filepath.Join(basedir, k)
@@ -1107,17 +1119,22 @@ func syncto(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntr
 func syncfrom(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntry, dry bool) {
 	// list localdir
 	dst := listlocal(basedir)
-	log.Println("local", dst)
+	log.Println("local", len(dst), "files")
 	// list s3
 	src := lists3(s3url, "/")
-	log.Println("s3", src)
-	to_update, to_del := changelist(basedir, src, dst, check_content)
+	log.Println("s3", len(src), "files")
+	to_update, to_del, usize := changelist(basedir, src, dst, check_content)
+	pbar = pb.New64(usize)
+	pbar.ShowSpeed = true
+	pbar.SetUnits(pb.U_BYTES)
+	pbar.Start()
+	defer pbar.Finish()
 	// get
 	bkt, prefix, err := url2bktpath(s3cl, s3url)
 	if err != nil {
 		log.Println("url error", err)
 	}
-	log.Println("get", len(to_update), "files")
+	log.Println("get", len(to_update), "files", len(to_del))
 	for _, k := range to_update {
 		dstname := filepath.Join(basedir, k)
 		srcname := filepath.Join(prefix, k)
@@ -1141,13 +1158,17 @@ func syncfrom(s3url, basedir string, check_content, do_del bool, ch chan *SyncEn
 func syncremote(s3url_src, s3url_dst string, check_content, do_del bool, ch chan *SyncEntry, dry bool) {
 	// list s3_src
 	src := lists3(s3url_src, "/")
-	log.Println("s3src", src)
+	log.Println("s3src", len(src), "files")
 	// list s3_dst
 	dst := lists3(s3url_dst, "/")
-	log.Println("s3dst", dst)
-	to_update, to_del := changelist("", src, dst, check_content)
+	log.Println("s3dst", len(dst), "files")
+	to_update, to_del, _ := changelist("", src, dst, check_content)
+	pbar = pb.New(len(to_update))
+	pbar.ShowCounters = true
+	pbar.Start()
+	defer pbar.Finish()
 	// putcopy
-	log.Println("putcopy", to_update)
+	log.Println("putcopy", to_update, "files", len(to_del))
 	for _, k := range to_update {
 		dsturl := fmt.Sprintf("%s/%s", s3url_dst, k)
 		srcurl := fmt.Sprintf("%s/%s", s3url_src, k)

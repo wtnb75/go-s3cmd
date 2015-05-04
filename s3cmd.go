@@ -962,6 +962,9 @@ func synccmd(c *cli.Context) {
 	}
 	ch <- nil
 	log.Println("wait finish")
+	if pbar != nil {
+		defer pbar.Finish()
+	}
 }
 
 type entry struct {
@@ -1083,7 +1086,6 @@ func syncto(s3url, basedir string, check_content, do_del bool, ch chan *SyncEntr
 	pbar.ShowSpeed = true
 	pbar.SetUnits(pb.U_BYTES)
 	pbar.Start()
-	defer pbar.Finish()
 	// put
 	bkt, prefix, err := url2bktpath(s3cl, s3url)
 	if err != nil {
@@ -1128,7 +1130,6 @@ func syncfrom(s3url, basedir string, check_content, do_del bool, ch chan *SyncEn
 	pbar.ShowSpeed = true
 	pbar.SetUnits(pb.U_BYTES)
 	pbar.Start()
-	defer pbar.Finish()
 	// get
 	bkt, prefix, err := url2bktpath(s3cl, s3url)
 	if err != nil {
@@ -1166,7 +1167,6 @@ func syncremote(s3url_src, s3url_dst string, check_content, do_del bool, ch chan
 	pbar = pb.New(len(to_update))
 	pbar.ShowCounters = true
 	pbar.Start()
-	defer pbar.Finish()
 	// putcopy
 	log.Println("putcopy", to_update, "files", len(to_del))
 	for _, k := range to_update {

@@ -9,12 +9,6 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"github.com/AdRoll/goamz/aws"
-	"github.com/AdRoll/goamz/s3"
-	"github.com/cheggaaa/pb"
-	"github.com/codegangsta/cli"
-	"github.com/vaughan0/go-ini"
-	"github.com/wtnb75/go-cmdrepl"
 	"io"
 	"io/ioutil"
 	"log"
@@ -28,6 +22,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AdRoll/goamz/aws"
+	"github.com/AdRoll/goamz/s3"
+	"github.com/cheggaaa/pb"
+	"github.com/urfave/cli"
+	"github.com/vaughan0/go-ini"
+	"github.com/wtnb75/go-cmdrepl"
 )
 
 type Config struct {
